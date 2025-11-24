@@ -1,0 +1,21 @@
+# 模型配置
+model:
+  model_id: "Qwen/Qwen3-8B-Instruct"  # HuggingFace 模型 ID
+  device_map: "auto"
+  use_4bit: true             # 是否开启 4-bit 量化 (节省显存)
+  max_new_tokens: 2048       # 生成的最大 token 数 (包含思考过程)
+
+# 生成参数 (Qwen3 Thinking Mode 推荐参数)
+generation:
+  temperature: 0.6
+  top_p: 0.95
+  top_k: 20
+  do_sample: true
+  min_p: 0.0
+
+# 数据路径
+paths:
+  raw_train_data: "data/raw/semeval2014_task4/Restaurants_Train.xml"
+  raw_test_data: "data/raw/semeval2014_task4/Restaurants_Test_Gold.xml"
+  processed_output_dir: "data/processed/"
+  prediction_output: "data/results/predictions.jsonl"
