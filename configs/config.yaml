@@ -1,0 +1,58 @@
+project:
+  name: "Qwen3-ABSA-Distillation"
+  output_dir: "./outputs"
+  seed: 42
+  device: "cuda"
+
+# 学生模型配置（Qwen3）
+model_student:
+  model_id: "unsloth/Qwen3-8B-Instruct" # [Correction] 使用Thinking变体
+  # 备选: "unsloth/Qwen3-30B-A3B-Thinking-2507-GGUF" (若显存充足)
+  load_in_4bit: true
+  max_seq_length: 8192      # Qwen3支持256k，但在ABSA中8k足够且节省显存
+  dtype: "bfloat16"         # 推荐用于Ampere架构
+  trust_remote_code: true
+  enable_thinking: true     # 开启原生思维模式 [7]
+
+# 教师模型配置（gpt-oss）
+model_teacher:
+  model_id: "unsloth/gpt-oss-20b-GGUF" # [Correction] 使用OpenAI开放模型作为教师
+  # 备选: "unsloth/gpt-oss-120b-GGUF" (若显存充足)
+  load_in_4bit: true
+  temperature: 0.3          # 教师模型需要低温度以保证生成事实性推理
+  max_new_tokens: 1024
+
+# 数据集配置
+data:
+  dataset_name: "sem_eval_2014_task_4"
+  data_dir: "./data/raw"
+  subsets: 
+    - "laptops"
+    - "restaurants"
+  prompt_style: "qwen_chat"
+  augmented_file: "./data/processed/sem_eval_augmented_cot.jsonl"
+
+# 推理与生成参数（针对Qwen3 Thinking优化）
+generation:
+  temperature: 0.6
+  top_p: 0.95
+  top_k: 20
+  min_p: 0.0
+  presence_penalty: 1.0     # 避免重复
+  max_tokens: 2048
+
+# 训练参数（LoRA微调）
+training:
+  type: "distillation"      # 策略：distillation 或 sft
+  batch_size: 2
+  gradient_accumulation_steps: 4
+  warmup_steps: 50
+  max_steps: 300
+  learning_rate: 2.0e-4
+  optimizer: "adamw_8bit"
+  weight_decay: 0.01
+  lora:
+    r: 16
+    lora_alpha: 16
+    lora_dropout: 0.05
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
