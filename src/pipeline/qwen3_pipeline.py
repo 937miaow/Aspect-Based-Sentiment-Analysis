@@ -4,17 +4,18 @@ from unsloth import FastLanguageModel
 from transformers import TextStreamer
 from..templates import SYSTEM_PROMPT, USER_PROMPT
 
-class Qwen3CoTPipeline:
-    def __init__(self, model_id: str, load_in_4bit: bool = True, max_seq_length: int = 2048):
-        print(f"Loading Qwen3 Model: {model_id}...")
-        self.model, self.tokenizer = FastLanguageModel.from_pretrained(
-            model_name=model_id,
-            max_seq_length=max_seq_length,
-            dtype=None,  # 自动检测 (Float16/Bfloat16)
-            load_in_4bit=load_in_4bit,
-        )
+class Qwen3CoTPipeline:         
+    def __init__(self, model, tokenizer):
+        """
+        初始化 Pipeline
+        :param model: 显存中已加载的 Unsloth 模型对象
+        :param tokenizer: 配套的 Tokenizer
+        """
+        self.model = model
+        self.tokenizer = tokenizer
+        
+        # 显式开启推理模式
         FastLanguageModel.for_inference(self.model)
-        self.eos_token = self.tokenizer.eos_token
 
     def predict(self, text: str, aspect: str, stream: bool = False) -> dict:
         """
@@ -22,11 +23,14 @@ class Qwen3CoTPipeline:
         """
         # 1. 格式化 Prompt
         # Qwen3 推荐使用 Chat 模板
+        formatted_user_content = USER_PROMPT.format(text=text, aspect=aspect)
+        
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": USER_PROMPT.format(text=text, aspect=aspect)},
+            {"role": "user", "content": formatted_user_content},
         ]
         
+        # 2. Tokenize & Template application
         inputs = self.tokenizer.apply_chat_template(
             messages,
             tokenize=True,
@@ -34,44 +38,62 @@ class Qwen3CoTPipeline:
             return_tensors="pt",
         ).to("cuda")
 
-        # 2. 生成 (Qwen3 Thinking 模式推荐参数: Temp 0.6, TopP 0.95)
-        # 这里的 enable_thinking=True 是 Qwen3 的特定行为，Unsloth 会保留
-        streamer = TextStreamer(self.tokenizer) if stream else None
-        
-        outputs = self.model.generate(
-            input_ids=inputs,
-            max_new_tokens=1024,
-            temperature=0.6, 
-            top_p=0.95,
-            min_p=0.0,
-            use_cache=True,
-            streamer=streamer
-        )
-        
-        decoded_output = self.tokenizer.decode(outputs, skip_special_tokens=False)
-        
-        # 3. 解析结果
-        return self._parse_output(decoded_output)
+        # 3. 生成配置
+        # stream=True 时，会在控制台看到思考过程逐字蹦出来
+        streamer = TextStreamer(self.tokenizer, skip_prompt=True) if stream else None
 
-    def _parse_output(self, raw_output: str) -> dict:
-        """
-        分离 <think> 内容和最终 JSON
-        """
-        # 提取 assistant 的回复部分
-        if "<|im_start|>assistant" in raw_output:
-            response = raw_output.split("<|im_start|>assistant")[-1].replace(self.eos_token, "").strip()
-        else:
-            response = raw_output
+        # 使用 no_grad 节省显存
+        with torch.no_grad():
+            outputs = self.model.generate(
+                input_ids=inputs,
+                attention_mask=torch.ones_like(inputs),
+                max_new_tokens=512,  # 给 CoT 留足空间
+                temperature=0.6,     # Qwen 推荐 Thinking 模式带一点温度
+                top_p=0.95,
+                use_cache=True,
+                streamer=streamer,   
+                pad_token_id=self.tokenizer.eos_token_id
+            )
+        
+        decoded_output = self.tokenizer.decode(outputs[0], skip_special_tokens=False)
+        
+        # 4. 解码 (只取新生成的部分)
+        generated_ids = outputs[0][inputs.shape[-1]:]
+        decoded_output = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        
+        # 5. 解析
+        parsed_result = self._parse_output(decoded_output)
 
-        # 提取思维链
-        think_match = re.search(r"<think>(.*?)</think>", response, re.DOTALL)
-        rationale = think_match.group(1).strip() if think_match else ""
-        
-        # 提取最终结论 (通常在 </think> 之后)
-        final_answer = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
-        
+        # 6. 返回结果时，把输入信息合并进去
+        # 这样结果字典就是完整的：{text, aspect, sentiment, rationale, full_response}
         return {
-            "full_response": response,
-            "rationale": rationale,  # CoT 部分
-            "prediction": final_answer # 期望是 JSON 或 Label
+            "input_text": text,      # 原文
+            "input_aspect": aspect,  # 目标方面
+            **parsed_result          # 解包解析后的结果 (rationale, sentiment, full_response)
+        }
+
+    def _parse_output(self, response: str) -> dict:
+        """
+        将模型的文本输出解析为字典 (JSON-like)
+        """
+        rationale = ""
+        prediction = "Unknown"
+
+        # 1. 提取 <think> 内容
+        think_match = re.search(r"<think>(.*?)</think>", response, re.DOTALL)
+        if think_match:
+            rationale = think_match.group(1).strip()
+
+        # 2. 提取 Final Sentiment
+        # 你的模型被训练为输出 "Final Sentiment: Positive"
+        if "Final Sentiment:" in response:
+            prediction = response.split("Final Sentiment:")[-1].strip()
+        else:
+            # 兜底：如果模型没按格式输出，尝试去除 <think> 后剩下的就是结论
+            prediction = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
+
+        return {
+            "full_response": response,   # 完整原始答案
+            "rationale": rationale,      # 思考过程
+            "sentiment": prediction      # 最终情感 (Positive/Negative/...)
         }
